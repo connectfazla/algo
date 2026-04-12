@@ -7,10 +7,10 @@
 //|                         + Smart Money Strategy (EMA9/20 + Sweep + OB)|
 //+------------------------------------------------------------------+
 #property copyright "Your Name"
-#property version   "2.41"
+#property version   "2.42"
 #property strict
 #property description "EA: MACD strategy OR Smart Money (Liquidity Sweep + Order Block)"
-#property description "v2.41: stricter entries, SL cap vs ATR, max-loss exit, earlier BE/trail"
+#property description "v2.42: branded dashboard UI; v2.41 risk/signal logic"
 
 #include <Trade/Trade.mqh>
 
@@ -26,8 +26,11 @@ input double   tpMult        = 0.0;      // 0 = no fixed TP (partials + trail); 
 input double   lotSize       = 0.1;
 input int      magicNumber   = 202403;
 input int      MinConfirmation = 72;     // Higher = fewer trades, higher selectivity (MACD mode)
-input color    PanelColor    = clrBlack;
+input color    PanelColor    = C'14,16,24';   // Main card background
 input color    TextColor     = clrWhite;
+input color    DashboardHeaderBg = C'8,10,22'; // Top brand bar
+input color    DashboardAccent   = C'218,165,32'; // Gold accent (title / stripe)
+input color    DashboardLabelDim = C'120,132,155'; // Row labels (left column)
 input int      PanelX        = 10;
 input int      PanelY        = 30;
 
@@ -506,7 +509,7 @@ int OnInit()
    RecoverExistingPositions();
 
    CreateDisplayPanel();
-   PrintFormat("FX_MILLIONAIRES v2.41 %s | TF=%s | pip=%.5f | trail@%.0f%% | maxSL=%.2f*ATR | maxLossPips=%d",
+   PrintFormat("FX_MILLIONAIRES v2.42 %s | TF=%s | pip=%.5f | trail@%.0f%% | maxSL=%.2f*ATR | maxLossPips=%d",
                _Symbol, EnumToString(Period()), PipSizeInPrice(),
                trailActivateFraction * 100.0, MaxSL_ATR_Cap, MaxLossPipsCut);
    return(INIT_SUCCEEDED);
@@ -1420,39 +1423,148 @@ bool DetectFVG(bool sweepHigh, bool sweepLow)
 //+------------------------------------------------------------------+
 //| Display functions                                                |
 //+------------------------------------------------------------------+
+void PanelSetLabelReadonly(const string name)
+{
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+}
+
 void CreateDisplayPanel()
 {
-   int w = 420, h = 250;
+   const int w = 452;
+   const int h = 300;
+   const int headerH = 52;
+   const int px = PanelX;
+   const int py = PanelY;
+
+   ObjectCreate(0, panelName+"SHADOW", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_XDISTANCE, px + 4);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_YDISTANCE, py + 4);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_YSIZE, h);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_BGCOLOR, C'0,0,0');
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_COLOR, C'0,0,0');
+   ObjectSetInteger(0, panelName+"SHADOW", OBJPROP_BACK, false);
+   PanelSetLabelReadonly(panelName+"SHADOW");
+
    ObjectCreate(0, panelName+"BG", OBJ_RECTANGLE_LABEL, 0, 0, 0);
-   ObjectSetInteger(0, panelName+"BG", OBJPROP_XDISTANCE, PanelX);
-   ObjectSetInteger(0, panelName+"BG", OBJPROP_YDISTANCE, PanelY);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_XDISTANCE, px);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_YDISTANCE, py);
    ObjectSetInteger(0, panelName+"BG", OBJPROP_XSIZE, w);
    ObjectSetInteger(0, panelName+"BG", OBJPROP_YSIZE, h);
    ObjectSetInteger(0, panelName+"BG", OBJPROP_BGCOLOR, PanelColor);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_COLOR, DashboardAccent);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, panelName+"BG", OBJPROP_BACK, false);
+   PanelSetLabelReadonly(panelName+"BG");
 
-   string labels[] = {"Strategy:","Account:","Balance:","Equity:","Position:","Entry:","Current:","P/L:","SL:","TP:","Partial:","Breakeven:","Trailing:","Signal:"};
-   int yStart = PanelY+25;
+   ObjectCreate(0, panelName+"HEADER", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_XDISTANCE, px);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_YDISTANCE, py);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_YSIZE, headerH);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_BGCOLOR, DashboardHeaderBg);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_COLOR, DashboardHeaderBg);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_WIDTH, 0);
+   ObjectSetInteger(0, panelName+"HEADER", OBJPROP_BACK, false);
+   PanelSetLabelReadonly(panelName+"HEADER");
+
+   ObjectCreate(0, panelName+"ACCENT", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_XDISTANCE, px);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_YDISTANCE, py + headerH - 3);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_YSIZE, 3);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_BGCOLOR, DashboardAccent);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, panelName+"ACCENT", OBJPROP_COLOR, DashboardAccent);
+   PanelSetLabelReadonly(panelName+"ACCENT");
+
+   ObjectCreate(0, panelName+"TITLE", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"TITLE", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"TITLE", OBJPROP_XDISTANCE, px + 16);
+   ObjectSetInteger(0, panelName+"TITLE", OBJPROP_YDISTANCE, py + 6);
+   ObjectSetString(0, panelName+"TITLE", OBJPROP_TEXT, "FX MILLIONAIRES");
+   ObjectSetString(0, panelName+"TITLE", OBJPROP_FONT, "Arial Black");
+   ObjectSetInteger(0, panelName+"TITLE", OBJPROP_FONTSIZE, 16);
+   ObjectSetInteger(0, panelName+"TITLE", OBJPROP_COLOR, DashboardAccent);
+   PanelSetLabelReadonly(panelName+"TITLE");
+
+   ObjectCreate(0, panelName+"TAG", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"TAG", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"TAG", OBJPROP_XDISTANCE, px + w - 118);
+   ObjectSetInteger(0, panelName+"TAG", OBJPROP_YDISTANCE, py + 10);
+   ObjectSetString(0, panelName+"TAG", OBJPROP_TEXT, "PRO SUITE");
+   ObjectSetString(0, panelName+"TAG", OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, panelName+"TAG", OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, panelName+"TAG", OBJPROP_COLOR, DashboardLabelDim);
+   PanelSetLabelReadonly(panelName+"TAG");
+
+   ObjectCreate(0, panelName+"SUB", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"SUB", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"SUB", OBJPROP_XDISTANCE, px + 16);
+   ObjectSetInteger(0, panelName+"SUB", OBJPROP_YDISTANCE, py + 32);
+   ObjectSetString(0, panelName+"SUB", OBJPROP_TEXT, "");
+   ObjectSetString(0, panelName+"SUB", OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, panelName+"SUB", OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, panelName+"SUB", OBJPROP_COLOR, C'160,172,198');
+   PanelSetLabelReadonly(panelName+"SUB");
+
+   ObjectCreate(0, panelName+"SEPH", OBJ_RECTANGLE_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_CORNER, CORNER_LEFT_UPPER);
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_XDISTANCE, px + 12);
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_YDISTANCE, py + headerH + 4);
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_XSIZE, w - 24);
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_YSIZE, 1);
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_BGCOLOR, C'45,50,68');
+   ObjectSetInteger(0, panelName+"SEPH", OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   PanelSetLabelReadonly(panelName+"SEPH");
+
+   string labels[] = {"Strategy","Account","Balance","Equity","Position","Entry","Current","P/L","SL","TP","Partial","Breakeven","Trailing","Signal"};
+   const int yStart = py + headerH + 14;
+   const int rowH = 16;
+   const int lblX = px + 16;
+   const int valX = px + 178;
+
    for(int i=0; i<14; i++)
    {
       ObjectCreate(0, panelName+"LBL"+IntegerToString(i), OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_XDISTANCE, PanelX+10);
-      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_YDISTANCE, yStart+i*13);
-      ObjectSetString(0, panelName+"LBL"+IntegerToString(i), OBJPROP_TEXT, labels[i]);
-      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_COLOR, TextColor);
+      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_XDISTANCE, lblX);
+      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_YDISTANCE, yStart + i * rowH);
+      ObjectSetString(0, panelName+"LBL"+IntegerToString(i), OBJPROP_TEXT, labels[i] + " ·");
+      ObjectSetString(0, panelName+"LBL"+IntegerToString(i), OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_FONTSIZE, 9);
+      ObjectSetInteger(0, panelName+"LBL"+IntegerToString(i), OBJPROP_COLOR, DashboardLabelDim);
+      PanelSetLabelReadonly(panelName+"LBL"+IntegerToString(i));
 
       ObjectCreate(0, panelName+"VAL"+IntegerToString(i), OBJ_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_XDISTANCE, PanelX+120);
-      ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_YDISTANCE, yStart+i*13);
+      ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_XDISTANCE, valX);
+      ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_YDISTANCE, yStart + i * rowH);
       ObjectSetString(0, panelName+"VAL"+IntegerToString(i), OBJPROP_TEXT, "---");
+      ObjectSetString(0, panelName+"VAL"+IntegerToString(i), OBJPROP_FONT, "Arial");
+      ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_FONTSIZE, 9);
       ObjectSetInteger(0, panelName+"VAL"+IntegerToString(i), OBJPROP_COLOR, TextColor);
+      PanelSetLabelReadonly(panelName+"VAL"+IntegerToString(i));
    }
 }
 
 void UpdateDisplay()
 {
+   ObjectSetString(0, panelName+"SUB", OBJPROP_TEXT,
+                    _Symbol + "  ·  " + EnumToString(Period()) + "  ·  Smart Money / MACD");
+
    ObjectSetString(0, panelName+"VAL1", OBJPROP_TEXT, AccountInfoString(ACCOUNT_NAME));
    ObjectSetString(0, panelName+"VAL2", OBJPROP_TEXT, DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2));
    ObjectSetString(0, panelName+"VAL3", OBJPROP_TEXT, DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2));
+   ObjectSetInteger(0, panelName+"VAL2", OBJPROP_COLOR, DashboardAccent);
+   ObjectSetInteger(0, panelName+"VAL3", OBJPROP_COLOR, DashboardAccent);
 
    string stratName = (ActiveStrategyMode() == 1) ? "MACD" : "Smart Money";
    if(SymbolIsGoldOrMetal())
@@ -1502,8 +1614,17 @@ void UpdateDisplay()
    ObjectSetString(0, panelName+"VAL11", OBJPROP_TEXT, be);
    ObjectSetString(0, panelName+"VAL12", OBJPROP_TEXT, trail);
 
-   if(StringFind(pl,"-")>=0) ObjectSetInteger(0, panelName+"VAL7", OBJPROP_COLOR, clrRed);
-   else if(pl!="---") ObjectSetInteger(0, panelName+"VAL7", OBJPROP_COLOR, clrLimeGreen);
+   if(StringFind(pl,"-")>=0)
+      ObjectSetInteger(0, panelName+"VAL7", OBJPROP_COLOR, clrTomato);
+   else if(pl!="---")
+      ObjectSetInteger(0, panelName+"VAL7", OBJPROP_COLOR, C'80,220,140');
+   else
+      ObjectSetInteger(0, panelName+"VAL7", OBJPROP_COLOR, TextColor);
+
+   ObjectSetInteger(0, panelName+"VAL0", OBJPROP_COLOR,
+                    (StringFind(stratName, "OUT")>=0 || StringFind(stratName, "Spr!")>=0) ? clrTomato : DashboardAccent);
+   ObjectSetInteger(0, panelName+"VAL4", OBJPROP_COLOR,
+                    (posType=="BUY") ? C'80,220,140' : (posType=="SELL") ? clrTomato : TextColor);
 }
 
 void UpdateSignalStrength(double buy, double sell)
