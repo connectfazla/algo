@@ -7,10 +7,10 @@
 //|                         + Smart Money Strategy (EMA9/20 + Sweep + OB)|
 //+------------------------------------------------------------------+
 #property copyright "Your Name"
-#property version   "2.42"
+#property version   "2.43"
 #property strict
 #property description "EA: MACD strategy OR Smart Money (Liquidity Sweep + Order Block)"
-#property description "v2.42: branded dashboard UI; v2.41 risk/signal logic"
+#property description "v2.43: equity + confirmation-tier sizing; optional split orders on max tier"
 
 #include <Trade/Trade.mqh>
 
@@ -86,6 +86,19 @@ input int      MaxSpreadPoints   = 0;          // 0 = disabled; else max SYMBOL_
 input double   MaxSL_ATR_Cap     = 2.55;       // Max entry→SL distance in ATR (stops huge OB/structure risk)
 input double   MinSL_ATR_Floor   = 0.7;        // Min SL distance in ATR (0 = off); avoids micro-stops
 input int      MaxLossPipsCut    = 320;        // 0 = off; force-close if open loss exceeds this many “pips”
+
+//--- Equity position size: higher confirmation → higher % of equity at risk (tiered)
+input bool     UseEquityRiskSizing = true;     // false = always use fixed lotSize
+input double   EquityRiskPctLow    = 0.30;     // % equity when conf in [MinConf, TierMid)
+input double   EquityRiskPctMid    = 0.65;     // % equity when conf in [TierMid, TierHigh)
+input double   EquityRiskPctHigh   = 1.15;     // % equity when conf >= TierHigh (strongest setups)
+input int      MacdConfTierMid     = 78;       // MACD buy/sell confirmation tier boundary
+input int      MacdConfTierHigh    = 88;
+input int      SMConfTierMid       = 86;       // Smart Money buyConf/sellConf tier boundary
+input int      SMConfTierHigh      = 94;
+input double   MaxLotsEquityCap    = 5.0;      // Hard cap on calculated volume
+input double   MinLotsEquityFloor  = 0.01;     // Floor after normalization (symbol min may override)
+input int      HighConfSplitCount  = 1;        // 1 = one order; 2–4 = split total lot (max tier only)
 
 //--- global variables
 CTrade         trade;
@@ -433,6 +446,150 @@ int ActiveStrategyMode()
 }
 
 //+------------------------------------------------------------------+
+double NormalizeLotsToSymbol(double v)
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double cap = MathMin(MaxLotsEquityCap, vmax);
+   if(step <= 0)
+      step = 0.01;
+   v = MathFloor(v / step) * step;
+   if(v < vmin)
+      v = vmin;
+   if(v > cap)
+      v = MathFloor(cap / step) * step;
+   if(v < vmin)
+      v = lotSize;
+   return NormalizeDouble(v, 8);
+}
+
+//+------------------------------------------------------------------+
+double MacdRiskPercentFromConf(const double conf)
+{
+   if(conf >= (double)MacdConfTierHigh)
+      return EquityRiskPctHigh;
+   if(conf >= (double)MacdConfTierMid)
+      return EquityRiskPctMid;
+   return EquityRiskPctLow;
+}
+
+//+------------------------------------------------------------------+
+double SMRiskPercentFromConf(const double conf)
+{
+   if(conf >= (double)SMConfTierHigh)
+      return EquityRiskPctHigh;
+   if(conf >= (double)SMConfTierMid)
+      return EquityRiskPctMid;
+   return EquityRiskPctLow;
+}
+
+//+------------------------------------------------------------------+
+double CalcLotsFromEquityRisk(const double entry, const double sl, const double riskPct)
+{
+   if(!UseEquityRiskSizing || riskPct <= 0)
+      return NormalizeLotsToSymbol(lotSize);
+
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq <= 0)
+      return NormalizeLotsToSymbol(lotSize);
+
+   double riskMoney = eq * (riskPct / 100.0);
+   double tickSz = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double dist = MathAbs(entry - sl);
+   if(tickSz <= 0 || tickVal <= 0 || dist < tickSz * 0.5)
+      return NormalizeLotsToSymbol(lotSize);
+
+   double lossPerLot = (dist / tickSz) * tickVal;
+   if(lossPerLot <= 0)
+      return NormalizeLotsToSymbol(lotSize);
+
+   double vol = riskMoney / lossPerLot;
+   if(vol < MinLotsEquityFloor)
+      vol = MinLotsEquityFloor;
+   return NormalizeLotsToSymbol(vol);
+}
+
+//+------------------------------------------------------------------+
+bool PlaceSplitBuys(const double totalLots, const double sl, const double tp, const string cmt)
+{
+   int n = HighConfSplitCount;
+   if(n < 1)
+      n = 1;
+   if(n > 8)
+      n = 8;
+   if(n < 2)
+      return trade.Buy(NormalizeLotsToSymbol(totalLots), _Symbol, 0, sl, tp, cmt);
+
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0)
+      step = 0.01;
+   double total = NormalizeLotsToSymbol(totalLots);
+   double minNeed = vmin * n;
+   if(total < minNeed - 1e-8)
+      return trade.Buy(total, _Symbol, 0, sl, tp, cmt);
+
+   double remaining = total;
+   for(int i = 0; i < n; i++)
+   {
+      int left = n - i;
+      double chunk = (i == n - 1) ? remaining : MathFloor((remaining / (double)left) / step) * step;
+      if(chunk < vmin)
+         chunk = vmin;
+      if(chunk > remaining)
+         chunk = remaining;
+      chunk = NormalizeDouble(chunk, 8);
+      if(chunk <= 0)
+         return false;
+      if(!trade.Buy(chunk, _Symbol, 0, sl, tp, cmt))
+         return false;
+      remaining = NormalizeDouble(remaining - chunk, 8);
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+bool PlaceSplitSells(const double totalLots, const double sl, const double tp, const string cmt)
+{
+   int n = HighConfSplitCount;
+   if(n < 1)
+      n = 1;
+   if(n > 8)
+      n = 8;
+   if(n < 2)
+      return trade.Sell(NormalizeLotsToSymbol(totalLots), _Symbol, 0, sl, tp, cmt);
+
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0)
+      step = 0.01;
+   double total = NormalizeLotsToSymbol(totalLots);
+   double minNeed = vmin * n;
+   if(total < minNeed - 1e-8)
+      return trade.Sell(total, _Symbol, 0, sl, tp, cmt);
+
+   double remaining = total;
+   for(int i = 0; i < n; i++)
+   {
+      int left = n - i;
+      double chunk = (i == n - 1) ? remaining : MathFloor((remaining / (double)left) / step) * step;
+      if(chunk < vmin)
+         chunk = vmin;
+      if(chunk > remaining)
+         chunk = remaining;
+      chunk = NormalizeDouble(chunk, 8);
+      if(chunk <= 0)
+         return false;
+      if(!trade.Sell(chunk, _Symbol, 0, sl, tp, cmt))
+         return false;
+      remaining = NormalizeDouble(remaining - chunk, 8);
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
@@ -509,9 +666,10 @@ int OnInit()
    RecoverExistingPositions();
 
    CreateDisplayPanel();
-   PrintFormat("FX_MILLIONAIRES v2.42 %s | TF=%s | pip=%.5f | trail@%.0f%% | maxSL=%.2f*ATR | maxLossPips=%d",
+   PrintFormat("FX_MILLIONAIRES v2.43 %s | TF=%s | pip=%.5f | equityRisk=%s | split=%d | trail@%.0f%%",
                _Symbol, EnumToString(Period()), PipSizeInPrice(),
-               trailActivateFraction * 100.0, MaxSL_ATR_Cap, MaxLossPipsCut);
+               UseEquityRiskSizing ? "on" : "off", HighConfSplitCount,
+               trailActivateFraction * 100.0);
    return(INIT_SUCCEEDED);
 }
 
@@ -918,14 +1076,14 @@ void ProcessOriginalStrategy()
    {
       if(isSellActive) ClosePosition(sellTicket);
       if(!isBuyActive && AllowNewEntries())
-         OpenBuy(atr[0]);
+         OpenBuy(atr[0], buyConfirmation);
    }
 
    if(sellSignal)
    {
       if(isBuyActive) ClosePosition(buyTicket);
       if(!isSellActive && AllowNewEntries())
-         OpenSell(atr[0]);
+         OpenSell(atr[0], sellConfirmation);
    }
 
    UpdateSignalStrength(buyConfirmation, sellConfirmation);
@@ -1016,13 +1174,13 @@ void ProcessSmartMoneyStrategy()
    {
       if(isSellActive) ClosePosition(sellTicket);
       if(AllowNewEntries())
-         OpenSmartMoneyBuy(atr[0]);
+         OpenSmartMoneyBuy(atr[0], buyConf);
    }
    if(sellSignal && !isSellActive)
    {
       if(isBuyActive) ClosePosition(buyTicket);
       if(AllowNewEntries())
-         OpenSmartMoneySell(atr[0]);
+         OpenSmartMoneySell(atr[0], sellConf);
    }
 
    UpdateSmartMoneyDisplay(sweepHigh, sweepLow, obFound, confidence);
@@ -1031,7 +1189,7 @@ void ProcessSmartMoneyStrategy()
 //+------------------------------------------------------------------+
 //| Open Buy (Original)                                              |
 //+------------------------------------------------------------------+
-void OpenBuy(double atrValue)
+void OpenBuy(double atrValue, const double macdBuyConf)
 {
    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double sl = NormalizeDouble(entryPrice - atrValue * slMult, _Digits);
@@ -1040,14 +1198,35 @@ void OpenBuy(double atrValue)
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice + atrValue * tpMult, _Digits);
 
-   if(trade.Buy(lotSize, _Symbol, 0, sl, tp, "FX Millionaires Buy"))
+   const double riskPct = MacdRiskPercentFromConf(macdBuyConf);
+   const double totalVol = CalcLotsFromEquityRisk(entryPrice, sl, riskPct);
+
+   bool ok = false;
+   if(macdBuyConf >= (double)MacdConfTierHigh && HighConfSplitCount >= 2)
+      ok = PlaceSplitBuys(totalVol, sl, tp, "FX Millionaires Buy");
+   else
+      ok = trade.Buy(NormalizeLotsToSymbol(totalVol), _Symbol, 0, sl, tp, "FX Millionaires Buy");
+
+   if(ok)
    {
       buyTicket = PositionTicketFromLastDeal(POSITION_TYPE_BUY);
+      if(buyTicket == 0)
+         buyTicket = FindOpenPositionTicket(POSITION_TYPE_BUY);
       isBuyActive = true;
-      buyOpenPrice = entryPrice;
-      buySL = sl;
-      buyTP = tp;
-      buyOriginalLot = lotSize;
+      if(buyTicket > 0 && PositionSelectByTicket(buyTicket))
+      {
+         buyOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         buySL = PositionGetDouble(POSITION_SL);
+         buyTP = PositionGetDouble(POSITION_TP);
+         buyOriginalLot = PositionGetDouble(POSITION_VOLUME);
+      }
+      else
+      {
+         buyOpenPrice = entryPrice;
+         buySL = sl;
+         buyTP = tp;
+         buyOriginalLot = NormalizeLotsToSymbol(totalVol);
+      }
       buyClosedFraction = 0;
       buyMaxProfitPips = 0;
       buyBreakevenTriggered = false;
@@ -1056,6 +1235,7 @@ void OpenBuy(double atrValue)
       buyInitialSLPips = StopLossDistancePips(buyOpenPrice, buySL, true);
       if(!CopyAtrPrevBar(buyEntryATR))
          buyEntryATR = atrValue;
+      PrintFormat("BUY lots=%.2f equityRisk=%.2f%% MACDconf=%.0f", buyOriginalLot, riskPct, macdBuyConf);
       if(buyTicket == 0)
          Print("Warning: BUY opened but position ticket not resolved; partial/BE/trail may fail until next tick.");
    }
@@ -1066,7 +1246,7 @@ void OpenBuy(double atrValue)
 //+------------------------------------------------------------------+
 //| Open Sell (Original)                                             |
 //+------------------------------------------------------------------+
-void OpenSell(double atrValue)
+void OpenSell(double atrValue, const double macdSellConf)
 {
    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl = NormalizeDouble(entryPrice + atrValue * slMult, _Digits);
@@ -1075,14 +1255,35 @@ void OpenSell(double atrValue)
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice - atrValue * tpMult, _Digits);
 
-   if(trade.Sell(lotSize, _Symbol, 0, sl, tp, "FX Millionaires Sell"))
+   const double riskPct = MacdRiskPercentFromConf(macdSellConf);
+   const double totalVol = CalcLotsFromEquityRisk(entryPrice, sl, riskPct);
+
+   bool ok = false;
+   if(macdSellConf >= (double)MacdConfTierHigh && HighConfSplitCount >= 2)
+      ok = PlaceSplitSells(totalVol, sl, tp, "FX Millionaires Sell");
+   else
+      ok = trade.Sell(NormalizeLotsToSymbol(totalVol), _Symbol, 0, sl, tp, "FX Millionaires Sell");
+
+   if(ok)
    {
       sellTicket = PositionTicketFromLastDeal(POSITION_TYPE_SELL);
+      if(sellTicket == 0)
+         sellTicket = FindOpenPositionTicket(POSITION_TYPE_SELL);
       isSellActive = true;
-      sellOpenPrice = entryPrice;
-      sellSL = sl;
-      sellTP = tp;
-      sellOriginalLot = lotSize;
+      if(sellTicket > 0 && PositionSelectByTicket(sellTicket))
+      {
+         sellOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         sellSL = PositionGetDouble(POSITION_SL);
+         sellTP = PositionGetDouble(POSITION_TP);
+         sellOriginalLot = PositionGetDouble(POSITION_VOLUME);
+      }
+      else
+      {
+         sellOpenPrice = entryPrice;
+         sellSL = sl;
+         sellTP = tp;
+         sellOriginalLot = NormalizeLotsToSymbol(totalVol);
+      }
       sellClosedFraction = 0;
       sellMaxProfitPips = 0;
       sellBreakevenTriggered = false;
@@ -1091,6 +1292,7 @@ void OpenSell(double atrValue)
       sellInitialSLPips = StopLossDistancePips(sellOpenPrice, sellSL, false);
       if(!CopyAtrPrevBar(sellEntryATR))
          sellEntryATR = atrValue;
+      PrintFormat("SELL lots=%.2f equityRisk=%.2f%% MACDconf=%.0f", sellOriginalLot, riskPct, macdSellConf);
       if(sellTicket == 0)
          Print("Warning: SELL opened but position ticket not resolved; partial/BE/trail may fail until next tick.");
    }
@@ -1101,7 +1303,7 @@ void OpenSell(double atrValue)
 //+------------------------------------------------------------------+
 //| Open Smart Money Buy                                             |
 //+------------------------------------------------------------------+
-void OpenSmartMoneyBuy(double atrValue)
+void OpenSmartMoneyBuy(double atrValue, const double smBuyConf)
 {
    if(RequireOBConfluence && (orderBlockHigh == 0 || orderBlockLow == 0))
       return;
@@ -1121,18 +1323,39 @@ void OpenSmartMoneyBuy(double atrValue)
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice + atrValue * tpMult, _Digits);
 
-   if(!trade.Buy(lotSize, _Symbol, 0, sl, tp, "SM Buy"))
+   const double riskPct = SMRiskPercentFromConf(smBuyConf);
+   const double totalVol = CalcLotsFromEquityRisk(entryPrice, sl, riskPct);
+
+   bool ok = false;
+   if(smBuyConf >= (double)SMConfTierHigh && HighConfSplitCount >= 2)
+      ok = PlaceSplitBuys(totalVol, sl, tp, "SM Buy");
+   else
+      ok = trade.Buy(NormalizeLotsToSymbol(totalVol), _Symbol, 0, sl, tp, "SM Buy");
+
+   if(!ok)
    {
       Print("Smart Money BUY failed: ", trade.ResultRetcodeDescription());
       return;
    }
 
    buyTicket = PositionTicketFromLastDeal(POSITION_TYPE_BUY);
+   if(buyTicket == 0)
+      buyTicket = FindOpenPositionTicket(POSITION_TYPE_BUY);
    isBuyActive = true;
-   buyOpenPrice = entryPrice;
-   buySL = sl;
-   buyTP = tp;
-   buyOriginalLot = lotSize;
+   if(buyTicket > 0 && PositionSelectByTicket(buyTicket))
+   {
+      buyOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      buySL = PositionGetDouble(POSITION_SL);
+      buyTP = PositionGetDouble(POSITION_TP);
+      buyOriginalLot = PositionGetDouble(POSITION_VOLUME);
+   }
+   else
+   {
+      buyOpenPrice = entryPrice;
+      buySL = sl;
+      buyTP = tp;
+      buyOriginalLot = NormalizeLotsToSymbol(totalVol);
+   }
    buyClosedFraction = 0;
    buyMaxProfitPips = 0;
    buyBreakevenTriggered = false;
@@ -1141,13 +1364,13 @@ void OpenSmartMoneyBuy(double atrValue)
    buyInitialSLPips = StopLossDistancePips(buyOpenPrice, buySL, true);
    if(!CopyAtrPrevBar(buyEntryATR))
       buyEntryATR = atrValue;
-   Print("Smart Money BUY order placed");
+   PrintFormat("Smart Money BUY lots=%.2f equityRisk=%.2f%% conf=%.0f", buyOriginalLot, riskPct, smBuyConf);
 }
 
 //+------------------------------------------------------------------+
 //| Open Smart Money Sell                                            |
 //+------------------------------------------------------------------+
-void OpenSmartMoneySell(double atrValue)
+void OpenSmartMoneySell(double atrValue, const double smSellConf)
 {
    if(RequireOBConfluence && (orderBlockHigh == 0 || orderBlockLow == 0))
       return;
@@ -1167,18 +1390,39 @@ void OpenSmartMoneySell(double atrValue)
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice - atrValue * tpMult, _Digits);
 
-   if(!trade.Sell(lotSize, _Symbol, 0, sl, tp, "SM Sell"))
+   const double riskPct = SMRiskPercentFromConf(smSellConf);
+   const double totalVol = CalcLotsFromEquityRisk(entryPrice, sl, riskPct);
+
+   bool ok = false;
+   if(smSellConf >= (double)SMConfTierHigh && HighConfSplitCount >= 2)
+      ok = PlaceSplitSells(totalVol, sl, tp, "SM Sell");
+   else
+      ok = trade.Sell(NormalizeLotsToSymbol(totalVol), _Symbol, 0, sl, tp, "SM Sell");
+
+   if(!ok)
    {
       Print("Smart Money SELL failed: ", trade.ResultRetcodeDescription());
       return;
    }
 
    sellTicket = PositionTicketFromLastDeal(POSITION_TYPE_SELL);
+   if(sellTicket == 0)
+      sellTicket = FindOpenPositionTicket(POSITION_TYPE_SELL);
    isSellActive = true;
-   sellOpenPrice = entryPrice;
-   sellSL = sl;
-   sellTP = tp;
-   sellOriginalLot = lotSize;
+   if(sellTicket > 0 && PositionSelectByTicket(sellTicket))
+   {
+      sellOpenPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      sellSL = PositionGetDouble(POSITION_SL);
+      sellTP = PositionGetDouble(POSITION_TP);
+      sellOriginalLot = PositionGetDouble(POSITION_VOLUME);
+   }
+   else
+   {
+      sellOpenPrice = entryPrice;
+      sellSL = sl;
+      sellTP = tp;
+      sellOriginalLot = NormalizeLotsToSymbol(totalVol);
+   }
    sellClosedFraction = 0;
    sellMaxProfitPips = 0;
    sellBreakevenTriggered = false;
@@ -1187,7 +1431,7 @@ void OpenSmartMoneySell(double atrValue)
    sellInitialSLPips = StopLossDistancePips(sellOpenPrice, sellSL, false);
    if(!CopyAtrPrevBar(sellEntryATR))
       sellEntryATR = atrValue;
-   Print("Smart Money SELL order placed");
+   PrintFormat("Smart Money SELL lots=%.2f equityRisk=%.2f%% conf=%.0f", sellOriginalLot, riskPct, smSellConf);
 }
 
 //+------------------------------------------------------------------+
