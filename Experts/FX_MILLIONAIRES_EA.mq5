@@ -1,17 +1,16 @@
 //+------------------------------------------------------------------+
 //|                                          FX_MILLIONAIRES_EA.mq5 |
 //|                                    Converted from Pine Script v6 |
-//|                         + Partial Take Profit (25/50/75/100 pips)|
-//|                         + Breakeven at 50% of initial SL         |
-//|                         + Trailing Stop after 50% partial close  |
+//|                         + Partial TP (ATR or pip) + capped SL vs ATR |
+//|                         + Breakeven + trail after configurable %   |
+//|                         + Emergency max-loss exit (pip budget)     |
 //|                         + Smart Money Strategy (EMA9/20 + Sweep + OB)|
 //+------------------------------------------------------------------+
 #property copyright "Your Name"
-#property version   "2.40"
+#property version   "2.41"
 #property strict
 #property description "EA: MACD strategy OR Smart Money (Liquidity Sweep + Order Block)"
-#property description "XAUUSD M15 preset: ATR partials, ATR trail, gold pip size, session/spread filter"
-#property description "Breakeven: when profit reaches fraction of initial SL; trail after 50% partial close"
+#property description "v2.41: stricter entries, SL cap vs ATR, max-loss exit, earlier BE/trail"
 
 #include <Trade/Trade.mqh>
 
@@ -22,11 +21,11 @@ input int      sigLen        = 9;
 input int      emaTrendLen   = 200;
 input int      rsiLen        = 14;
 input int      atrLen        = 14;
-input double   slMult        = 2.2;      // XAU M15: wider SL vs noise (ATR multiple)
+input double   slMult        = 2.0;      // Base SL distance (ATR); capped by MaxSL_ATR_Cap below
 input double   tpMult        = 0.0;      // 0 = no fixed TP (partials + trail); try 4–6 for hard TP tests
 input double   lotSize       = 0.1;
 input int      magicNumber   = 202403;
-input int      MinConfirmation = 65;     // Slightly stricter for gold chop (MACD mode)
+input int      MinConfirmation = 72;     // Higher = fewer trades, higher selectivity (MACD mode)
 input color    PanelColor    = clrBlack;
 input color    TextColor     = clrWhite;
 input int      PanelX        = 10;
@@ -38,17 +37,18 @@ input double   PartialPip1   = 20;       // fallback pip thresholds when ATR par
 input double   PartialPip2   = 45;
 input double   PartialPip3   = 80;
 input double   PartialPip4   = 120;
-input double   PartialPct1   = 25;       // % of original lot to close at first threshold
-input double   PartialPct2   = 50;       // cumulative % after second threshold
+input double   PartialPct1   = 30;       // Bank more at first target (higher realized win rate)
+input double   PartialPct2   = 55;       // cumulative % after second threshold
 input double   PartialPct3   = 75;       // cumulative % after third threshold
 input double   PartialPct4   = 100;      // cumulative % after fourth threshold
 
 //--- Breakeven parameters
 input bool     UseBreakeven  = true;     // Enable breakeven when profit reaches fraction of initial SL
-input double   BreakevenFraction = 0.5;  // Fraction of initial stop loss (in pips) to trigger breakeven (0.5 = 50%)
+input double   BreakevenFraction = 0.38; // Lower = move to BE sooner (cuts give-back / large losers)
 
 //--- Trailing stop parameters (NEW)
-input bool     UseTrailingAfter50Percent = true;  // Activate trailing stop after 50% of position closed
+input bool     UseTrailingAfterPartial = true;   // Trailing after partial volume >= TrailActivateAtPct%
+input int      TrailActivateAtPct    = 25;        // e.g. 25 = start trailing after first 25% closed (was 50%)
 input double   TrailPips     = 22;               // Trailing distance when TrailUseAtr=false (gold pips)
 
 //--- Smart Money Strategy parameters
@@ -59,16 +59,18 @@ input int      emaSlow       = 20;
 input int      sweepLookback = 36;             // M15 XAU: slightly wider swing context
 input int      obLookback    = 15;             // Bars back to find Order Block
 input double   obEntryZone   = 0.618;          // Fibonacci retracement for OB entry
-input double   minSweepSize  = 0.35;           // Filter micro-sweeps on volatile gold
+input double   minSweepSize  = 0.42;           // Stricter sweeps = fewer false signals (Smart Money)
 input bool     RequireOBConfluence = true;     // Must have an Order Block
 input bool     RequireFVGConfluence = false;   // Also require FVG
+input int      MinSmartMoneyConf = 82;         // Min confidence % to take SM entry (higher win selectivity)
+input bool     UseEMA200FilterSM = true;       // SM longs only above EMA200, shorts only below
 
 //--- XAUUSD M15: ATR-based exits + trade filters (maximize adaptability vs fixed pips)
 input bool     UseAtrPartialTp   = true;       // Partial levels = multiple of ATR at entry (bar 1)
-input double   PartialAtr1       = 1.0;
-input double   PartialAtr2       = 2.0;
-input double   PartialAtr3       = 3.2;
-input double   PartialAtr4       = 4.8;
+input double   PartialAtr1       = 0.75;       // Earlier first partial = bank winners faster
+input double   PartialAtr2       = 1.75;
+input double   PartialAtr3       = 2.9;
+input double   PartialAtr4       = 4.2;
 input bool     TrailUseAtr       = true;       // Trail distance = TrailAtrMult * current ATR (bar 1)
 input double   TrailAtrMult      = 1.25;
 input bool     UseSessionFilter  = true;       // Block new entries outside hours (GMT or server)
@@ -76,6 +78,11 @@ input bool     SessionUseGMT     = true;       // true: SessionStart/End are GMT
 input int      SessionStartHour  = 7;          // London–NY window friendly to XAU (inclusive)
 input int      SessionEndHour    = 21;
 input int      MaxSpreadPoints   = 0;          // 0 = disabled; else max SYMBOL_SPREAD for new entries
+
+//--- Loss control (caps oversized stops & hard stop on deep float loss)
+input double   MaxSL_ATR_Cap     = 2.55;       // Max entry→SL distance in ATR (stops huge OB/structure risk)
+input double   MinSL_ATR_Floor   = 0.7;        // Min SL distance in ATR (0 = off); avoids micro-stops
+input int      MaxLossPipsCut    = 320;        // 0 = off; force-close if open loss exceeds this many “pips”
 
 //--- global variables
 CTrade         trade;
@@ -128,6 +135,7 @@ double         partialCumFrac[4];
 double         partialAtrMult[4];
 double         buyEntryATR  = 0;
 double         sellEntryATR = 0;
+double         trailActivateFraction = 0.25;
 
 //+------------------------------------------------------------------+
 bool SymbolIsGoldOrMetal()
@@ -249,6 +257,90 @@ double TrailingDistancePrice()
    if(pip <= 0)
       return _Point * 10;
    return TrailPips * pip;
+}
+
+//+------------------------------------------------------------------+
+//| Cap / floor stop distance vs ATR (prevents huge OB-based risk)    |
+//+------------------------------------------------------------------+
+double NormalizeStopWithAtrCap(const double entry, double sl, const bool isBuy, const double atr)
+{
+   if(atr <= 0 || sl <= 0)
+      return NormalizeDouble(sl, _Digits);
+   if(MaxSL_ATR_Cap <= 0 && MinSL_ATR_Floor <= 0)
+      return NormalizeDouble(sl, _Digits);
+
+   const double maxDist = (MaxSL_ATR_Cap > 0) ? atr * MaxSL_ATR_Cap : 1.0e100;
+
+   double dist = isBuy ? (entry - sl) : (sl - entry);
+   if(dist <= 0)
+      return NormalizeDouble(sl, _Digits);
+
+   if(dist > maxDist)
+      sl = isBuy ? (entry - maxDist) : (entry + maxDist);
+
+   if(MinSL_ATR_Floor > 0)
+   {
+      double minDist = atr * MinSL_ATR_Floor;
+      dist = isBuy ? (entry - sl) : (sl - entry);
+      if(dist < minDist)
+         sl = isBuy ? (entry - minDist) : (entry + minDist);
+   }
+   return NormalizeDouble(sl, _Digits);
+}
+
+//+------------------------------------------------------------------+
+void EmergencyCloseBuy(const string reason)
+{
+   if(buyTicket > 0 && PositionSelectByTicket(buyTicket))
+      trade.PositionClose(buyTicket);
+   isBuyActive = false;
+   buyTicket = 0;
+   buyOriginalLot = 0;
+   buyClosedFraction = 0;
+   buyMaxProfitPips = 0;
+   buyTrailingActive = false;
+   buyEntryATR = 0;
+   Print("BUY ", reason);
+}
+
+//+------------------------------------------------------------------+
+void EmergencyCloseSell(const string reason)
+{
+   if(sellTicket > 0 && PositionSelectByTicket(sellTicket))
+      trade.PositionClose(sellTicket);
+   isSellActive = false;
+   sellTicket = 0;
+   sellOriginalLot = 0;
+   sellClosedFraction = 0;
+   sellMaxProfitPips = 0;
+   sellTrailingActive = false;
+   sellEntryATR = 0;
+   Print("SELL ", reason);
+}
+
+//+------------------------------------------------------------------+
+void ManageEmergencyMaxLoss()
+{
+   if(MaxLossPipsCut <= 0)
+      return;
+   double pip = PipSizeInPrice();
+   if(pip <= 0)
+      return;
+
+   if(isBuyActive && buyTicket > 0 && PositionSelectByTicket(buyTicket))
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double lossPips = (bid - buyOpenPrice) / pip;
+      if(lossPips <= -(double)MaxLossPipsCut)
+         EmergencyCloseBuy("max loss exit");
+   }
+   if(isSellActive && sellTicket > 0 && PositionSelectByTicket(sellTicket))
+   {
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double profitPips = (sellOpenPrice - ask) / pip;
+      if(profitPips <= -(double)MaxLossPipsCut)
+         EmergencyCloseSell("max loss exit");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -378,10 +470,15 @@ int OnInit()
    for(int k=1; k<4; k++)
       if(partialAtrMult[k] < partialAtrMult[k-1])
       {
-         Print("Partial ATR multiples must be non-decreasing. Resetting to 1.0,2.0,3.2,4.8.");
-         partialAtrMult[0]=1.0; partialAtrMult[1]=2.0; partialAtrMult[2]=3.2; partialAtrMult[3]=4.8;
+         Print("Partial ATR multiples must be non-decreasing. Resetting to 0.75,1.75,2.9,4.2.");
+         partialAtrMult[0]=0.75; partialAtrMult[1]=1.75; partialAtrMult[2]=2.9; partialAtrMult[3]=4.2;
          break;
       }
+
+   int tap = TrailActivateAtPct;
+   if(tap < 5)  tap = 5;
+   if(tap > 90) tap = 90;
+   trailActivateFraction = tap / 100.0;
 
    // Original indicators
    macdHandle = iMACD(_Symbol, PERIOD_CURRENT, fastLen, slowLen, sigLen, PRICE_CLOSE);
@@ -409,11 +506,9 @@ int OnInit()
    RecoverExistingPositions();
 
    CreateDisplayPanel();
-   PrintFormat("FX_MILLIONAIRES v2.40 %s | TF=%s | pip(price)=%.5f | XAU=%s | ATR-partial=%s | session=%s",
+   PrintFormat("FX_MILLIONAIRES v2.41 %s | TF=%s | pip=%.5f | trail@%.0f%% | maxSL=%.2f*ATR | maxLossPips=%d",
                _Symbol, EnumToString(Period()), PipSizeInPrice(),
-               SymbolIsGoldOrMetal() ? "yes" : "no",
-               UseAtrPartialTp ? "on" : "off",
-               UseSessionFilter ? (SessionUseGMT ? "GMT" : "server") : "off");
+               trailActivateFraction * 100.0, MaxSL_ATR_Cap, MaxLossPipsCut);
    return(INIT_SUCCEEDED);
 }
 
@@ -500,8 +595,10 @@ void OnTick()
    if(UseBreakeven)
       ManageBreakeven();
 
+   ManageEmergencyMaxLoss();
+
    // --- Manage Trailing Stop (every tick) - only if active
-   if(UseTrailingAfter50Percent)
+   if(UseTrailingAfterPartial)
       ManageTrailingStop();
 
    // --- new bar check for signal generation
@@ -565,11 +662,11 @@ void ManagePartialTakeProfit()
                   PrintFormat("Partial TP: closed %.2f lots (%.0f%%) at +%.1f pips",
                               volumeToClose, targetFrac*100, markPips);
 
-               if(UseTrailingAfter50Percent && !buyTrailingActive && oldClosedFraction < 0.5 && buyClosedFraction >= 0.5)
+               if(UseTrailingAfterPartial && !buyTrailingActive && oldClosedFraction < trailActivateFraction && buyClosedFraction >= trailActivateFraction)
                {
                   buyTrailingActive = true;
                   buyTrailingBestPrice = currentPrice;
-                  Print("Trailing stop activated for BUY (50% of position closed)");
+                     Print("Trailing stop activated for BUY (partial threshold reached)");
                }
 
                if(buyClosedFraction >= 0.999)
@@ -624,11 +721,11 @@ void ManagePartialTakeProfit()
                   PrintFormat("Partial TP: closed %.2f lots (%.0f%%) at +%.1f pips",
                               volumeToClose, targetFrac*100, markPips);
 
-               if(UseTrailingAfter50Percent && !sellTrailingActive && oldClosedFraction < 0.5 && sellClosedFraction >= 0.5)
+               if(UseTrailingAfterPartial && !sellTrailingActive && oldClosedFraction < trailActivateFraction && sellClosedFraction >= trailActivateFraction)
                {
                   sellTrailingActive = true;
                   sellTrailingBestPrice = currentPrice;
-                  Print("Trailing stop activated for SELL (50% of position closed)");
+                     Print("Trailing stop activated for SELL (partial threshold reached)");
                }
 
                if(sellClosedFraction >= 0.999)
@@ -787,8 +884,8 @@ void ProcessOriginalStrategy()
    bool trendBull = (closePrev > ema200[0]);
    bool trendBear = (closePrev < ema200[0]);
 
-   bool rsiBullish = (rsi[0] > 50 && rsi[0] < 70);
-   bool rsiBearish = (rsi[0] < 50 && rsi[0] > 30);
+   bool rsiBullish = (rsi[0] > 50 && rsi[0] < 66);
+   bool rsiBearish = (rsi[0] < 50 && rsi[0] > 34);
    double rsiStrength = MathAbs(rsi[0] - 50) / 20;
 
    double macdStrength = MathAbs(macdMain[1] - macdSignal[1]) / (atr[0] + _Point);
@@ -840,6 +937,15 @@ void ProcessSmartMoneyStrategy()
    if(CopyBuffer(atrHandle, 0, 1, 1, atr) < 1)
       return;
 
+   double ema200SM[1];
+   double closePrev = 0;
+   if(UseEMA200FilterSM)
+   {
+      if(CopyBuffer(ema200Handle, 0, 1, 1, ema200SM) < 1)
+         return;
+      closePrev = GetClose(1);
+   }
+
    DetectSwingPoints();
    bool sweepHigh = DetectSweep(true, atr[0]);
    bool sweepLow  = DetectSweep(false, atr[0]);
@@ -865,15 +971,15 @@ void ProcessSmartMoneyStrategy()
    bool trendDown = (ema9[0] < ema20[0]);
 
    bool buySignal = false, sellSignal = false;
-   double confidence = 0;
+   double buyConf = 0, sellConf = 0;
 
    if(sweepHigh && obFound && trendUp)
    {
       if(!RequireFVGConfluence || (RequireFVGConfluence && fvgDetected))
       {
          buySignal = true;
-         confidence = 70 + (obFound ? 20 : 0) + (trendUp ? 10 : 0);
-         if(RequireFVGConfluence && fvgDetected) confidence += 10;
+         buyConf = 70 + (obFound ? 20 : 0) + (trendUp ? 10 : 0);
+         if(RequireFVGConfluence && fvgDetected) buyConf += 10;
       }
    }
    if(sweepLow && obFound && trendDown)
@@ -881,11 +987,25 @@ void ProcessSmartMoneyStrategy()
       if(!RequireFVGConfluence || (RequireFVGConfluence && fvgDetected))
       {
          sellSignal = true;
-         confidence = 70 + (obFound ? 20 : 0) + (trendDown ? 10 : 0);
-         if(RequireFVGConfluence && fvgDetected) confidence += 10;
+         sellConf = 70 + (obFound ? 20 : 0) + (trendDown ? 10 : 0);
+         if(RequireFVGConfluence && fvgDetected) sellConf += 10;
       }
    }
 
+   if(UseEMA200FilterSM)
+   {
+      if(buySignal && closePrev <= ema200SM[0])
+         buySignal = false;
+      if(sellSignal && closePrev >= ema200SM[0])
+         sellSignal = false;
+   }
+
+   if(buySignal && buyConf < (double)MinSmartMoneyConf)
+      buySignal = false;
+   if(sellSignal && sellConf < (double)MinSmartMoneyConf)
+      sellSignal = false;
+
+   double confidence = MathMax(buyConf, sellConf);
    confidence = MathMin(confidence, 100);
    currentConfidence = confidence;
 
@@ -912,6 +1032,7 @@ void OpenBuy(double atrValue)
 {
    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double sl = NormalizeDouble(entryPrice - atrValue * slMult, _Digits);
+   sl = NormalizeStopWithAtrCap(entryPrice, sl, true, atrValue);
    double tp = 0;
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice + atrValue * tpMult, _Digits);
@@ -946,6 +1067,7 @@ void OpenSell(double atrValue)
 {
    double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double sl = NormalizeDouble(entryPrice + atrValue * slMult, _Digits);
+   sl = NormalizeStopWithAtrCap(entryPrice, sl, false, atrValue);
    double tp = 0;
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice - atrValue * tpMult, _Digits);
@@ -991,6 +1113,7 @@ void OpenSmartMoneyBuy(double atrValue)
 
    double sl = (orderBlockLow > 0) ? orderBlockLow - atrValue*0.5 : entryPrice - atrValue*slMult;
    sl = NormalizeDouble(sl, _Digits);
+   sl = NormalizeStopWithAtrCap(entryPrice, sl, true, atrValue);
    double tp = 0;
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice + atrValue * tpMult, _Digits);
@@ -1036,6 +1159,7 @@ void OpenSmartMoneySell(double atrValue)
 
    double sl = (orderBlockHigh > 0) ? orderBlockHigh + atrValue*0.5 : entryPrice + atrValue*slMult;
    sl = NormalizeDouble(sl, _Digits);
+   sl = NormalizeStopWithAtrCap(entryPrice, sl, false, atrValue);
    double tp = 0;
    if(tpMult > 0)
       tp = NormalizeDouble(entryPrice - atrValue * tpMult, _Digits);
