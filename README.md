@@ -1,4 +1,4 @@
-# Swift Algo Bot - MT5 Expert Advisor
+# Swift Algo Bot - MT5 Expert Advisor - Fazla Rabbi
 
 Automated multi-confluence trading bot for MetaTrader 5 with ATR-based risk management, trailing stops, and a real-time on-chart dashboard.
 
