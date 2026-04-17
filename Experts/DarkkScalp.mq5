@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "darkk"
 #property link      ""
-#property version   "2.01"
+#property version   "2.03"
 #property strict
 #property description "DarkkScalp Aggressive: XAU M1/M5 scalper using EMA trend + RSI pullback."
 #property description "Designed for cent/micro accounts. Aggressive risk. Use demo/backtest first."
@@ -71,10 +71,10 @@ input bool     InpUseCandleConfirm   = false;    // true = fewer but cleaner tra
 input bool     InpUseEMATouchPullback= true;     // More entries using EMA pullback/touch logic
 
 //--- Spread and session filters
-input int      InpMaxSpreadPts       = 300;      // XAU spread filter. Adjust to broker digits
-input bool     InpUseSession         = true;
-input int      InpSessStart          = 7;        // Server time
-input int      InpSessEnd            = 21;       // Server time
+input int      InpMaxSpreadPts       = 0;        // 0 = off. Else max SYMBOL_SPREAD (points) — if no trades, try 0 first
+input bool     InpUseSession         = false;     // false = trade 24h (server time). true = only InpSessStart–End
+input int      InpSessStart          = 7;        // Server time (hour)
+input int      InpSessEnd            = 21;       // Server time (hour), exclusive end
 
 //--- Trade management
 input bool     InpUseBE              = true;
@@ -99,6 +99,7 @@ string         g_panel               = "DARKK_SCALP_AGG_";
 string         g_sym                 = "";
 int            g_symDigits           = 0;
 double         g_symPt               = 0.0;
+datetime       g_lastBlockPrint      = 0;
 
 //+------------------------------------------------------------------+
 bool IsGoldSymbol(const string sym)
@@ -333,6 +334,72 @@ bool StopsDistanceOK(const bool buy, const double px, const double sl, const dou
 }
 
 //+------------------------------------------------------------------+
+// Widen SL/TP to broker SYMBOL_TRADE_STOPS_LEVEL / FREEZE (live often rejects tight ATR stops).
+void EnsureMinStopLevels(const bool buy, const double px, double &sl, double &tp)
+{
+   int stopsLevel = (int)SymbolInfoInteger(g_sym, SYMBOL_TRADE_STOPS_LEVEL);
+   int freezeLvl  = (int)SymbolInfoInteger(g_sym, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minD    = (double)MathMax(stopsLevel, freezeLvl) * g_symPt;
+   if(minD <= 0.0)
+      return;
+
+   if(buy)
+   {
+      if((px - sl) < minD)
+         sl = NormalizeDouble(px - minD, g_symDigits);
+      if((tp - px) < minD)
+         tp = NormalizeDouble(px + minD, g_symDigits);
+   }
+   else
+   {
+      if((sl - px) < minD)
+         sl = NormalizeDouble(px + minD, g_symDigits);
+      if((px - tp) < minD)
+         tp = NormalizeDouble(px - minD, g_symDigits);
+   }
+}
+
+//+------------------------------------------------------------------+
+string LiveGateStatus()
+{
+   if(!TerminalOk())
+      return "Status: AutoTrading OFF — enable toolbar + EA 'Allow Algo'";
+
+   if(InpMaxSpreadPts > 0)
+   {
+      long sp = (long)SymbolInfoInteger(g_sym, SYMBOL_SPREAD);
+      if(sp > InpMaxSpreadPts)
+         return StringFormat("Status: spread blocked %d (max %d pts)", sp, InpMaxSpreadPts);
+   }
+
+   if(InpUseSession && !SessionOK())
+      return "Status: outside session (broker server hour)";
+
+   int ent = 0;
+   double p = TodayProfit(ent);
+
+   if(InpMaxTradesPerDay > 0 && ent >= InpMaxTradesPerDay)
+      return "Status: daily max trades reached";
+
+   if(InpUseDailyProfitStop && p >= InpDailyProfitTarget)
+      return "Status: daily profit target — no new entries";
+
+   if(InpUseDailyLossStop && p <= -InpDailyLossLimit)
+      return "Status: daily loss limit — no new entries";
+
+   if(g_posTicket != 0)
+      return "Status: position open (one at a time)";
+
+   if(!CooldownOK())
+      return "Status: cooldown between entries";
+
+   if(iBars(g_sym, PERIOD_CURRENT) < InpEMATrend + 20)
+      return "Status: need more bars (wait for history)";
+
+   return "Status: scanning — waiting for signal";
+}
+
+//+------------------------------------------------------------------+
 void PanelCreate()
 {
    if(!InpShowPanel) return;
@@ -341,7 +408,7 @@ void PanelCreate()
    ObjectSetInteger(0, g_panel + "BG", OBJPROP_XDISTANCE, InpPanelX);
    ObjectSetInteger(0, g_panel + "BG", OBJPROP_YDISTANCE, InpPanelY);
    ObjectSetInteger(0, g_panel + "BG", OBJPROP_XSIZE, 355);
-   ObjectSetInteger(0, g_panel + "BG", OBJPROP_YSIZE, 92);
+   ObjectSetInteger(0, g_panel + "BG", OBJPROP_YSIZE, 108);
    ObjectSetInteger(0, g_panel + "BG", OBJPROP_BGCOLOR, C'10,14,22');
    ObjectSetInteger(0, g_panel + "BG", OBJPROP_BORDER_TYPE, BORDER_FLAT);
    ObjectSetInteger(0, g_panel + "BG", OBJPROP_COLOR, C'70,160,120');
@@ -349,7 +416,7 @@ void PanelCreate()
    ObjectCreate(0, g_panel + "T", OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, g_panel + "T", OBJPROP_XDISTANCE, InpPanelX + 10);
    ObjectSetInteger(0, g_panel + "T", OBJPROP_YDISTANCE, InpPanelY + 6);
-   ObjectSetString(0, g_panel + "T", OBJPROP_TEXT, "DARKK SCALP AGGRESSIVE v2");
+   ObjectSetString(0, g_panel + "T", OBJPROP_TEXT, "DARKK SCALP AGGRESSIVE v2.03");
    ObjectSetString(0, g_panel + "T", OBJPROP_FONT, "Arial Black");
    ObjectSetInteger(0, g_panel + "T", OBJPROP_FONTSIZE, 13);
    ObjectSetInteger(0, g_panel + "T", OBJPROP_COLOR, C'120,230,170');
@@ -377,6 +444,14 @@ void PanelCreate()
    ObjectSetString(0, g_panel + "D", OBJPROP_FONT, "Arial");
    ObjectSetInteger(0, g_panel + "D", OBJPROP_FONTSIZE, 8);
    ObjectSetInteger(0, g_panel + "D", OBJPROP_COLOR, clrWhite);
+
+   ObjectCreate(0, g_panel + "X", OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, g_panel + "X", OBJPROP_XDISTANCE, InpPanelX + 10);
+   ObjectSetInteger(0, g_panel + "X", OBJPROP_YDISTANCE, InpPanelY + 88);
+   ObjectSetString(0, g_panel + "X", OBJPROP_TEXT, "");
+   ObjectSetString(0, g_panel + "X", OBJPROP_FONT, "Arial");
+   ObjectSetInteger(0, g_panel + "X", OBJPROP_FONTSIZE, 8);
+   ObjectSetInteger(0, g_panel + "X", OBJPROP_COLOR, clrGold);
 }
 
 //+------------------------------------------------------------------+
@@ -403,6 +478,7 @@ void PanelUpdate()
 
    ObjectSetString(0, g_panel + "L", OBJPROP_TEXT, s);
    ObjectSetString(0, g_panel + "D", OBJPROP_TEXT, d);
+   ObjectSetString(0, g_panel + "X", OBJPROP_TEXT, LiveGateStatus());
 }
 
 //+------------------------------------------------------------------+
@@ -454,7 +530,7 @@ int OnInit()
    PanelCreate();
    ScanPosition();
 
-   Print("DarkkScalp Aggressive v2.01 loaded | TRADE=", g_sym,
+   Print("DarkkScalp Aggressive v2.03 loaded | TRADE=", g_sym,
          (g_sym != _Symbol ? " | CHART=" + _Symbol : ""),
          " | TF=", EnumToString((ENUM_TIMEFRAMES)Period()),
          " | Risk%=", DoubleToString(InpRiskPercent, 2),
@@ -583,9 +659,18 @@ void OpenOrder(const bool buy, const double atrVal)
       tp = NormalizeDouble(px - atrVal * InpTP_ATR_Mult, g_symDigits);
    }
 
+   EnsureMinStopLevels(buy, px, sl, tp);
+
    if(!StopsDistanceOK(buy, px, sl, tp))
    {
-      if(InpDebugPrint) Print("Stops too close for broker rules. Trade skipped.");
+      if(TimeCurrent() - g_lastBlockPrint >= 60)
+      {
+         g_lastBlockPrint = TimeCurrent();
+         Print("DarkkScalp: stops still invalid after min adjustment — check SYMBOL_TRADE_STOPS_LEVEL. SL=",
+               DoubleToString(sl, g_symDigits), " TP=", DoubleToString(tp, g_symDigits));
+      }
+      else if(InpDebugPrint)
+         Print("Stops too close for broker rules. Trade skipped.");
       return;
    }
 
