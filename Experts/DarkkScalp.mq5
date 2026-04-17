@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "darkk"
 #property link      ""
-#property version   "2.03"
+#property version   "2.21"
 #property strict
 #property description "DarkkScalp Aggressive: XAU M1/M5 scalper using EMA trend + RSI pullback."
 #property description "Designed for cent/micro accounts. Aggressive risk. Use demo/backtest first."
@@ -34,6 +34,7 @@ input double   InpFixedLots          = 0.01;
 input double   InpMaxLots            = 3.00;
 input double   InpMinLots            = 0.01;
 input bool     InpForceMinLot        = true;     // If risk calc is below min lot, still trade min lot
+input int      InpMaxOpenPositions   = 5;        // Max simultaneous positions (symbol+magic). 0 = unlimited. Needs hedge account for multiple.
 
 //--- Daily account protection
 input bool     InpUseDailyProfitStop = true;
@@ -94,6 +95,7 @@ int            hEMAf, hEMAs, hEMAt, hRSI, hATR, hADX;
 datetime       g_lastBarTime         = 0;
 ulong          g_posTicket           = 0;
 int            g_posType             = -1;
+int            g_posCount            = 0;
 datetime       g_lastEntryTime       = 0;
 string         g_panel               = "DARKK_SCALP_AGG_";
 string         g_sym                 = "";
@@ -285,7 +287,8 @@ bool SessionOK()
 void ScanPosition()
 {
    g_posTicket = 0;
-   g_posType = -1;
+   g_posType   = -1;
+   g_posCount  = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -294,9 +297,12 @@ void ScanPosition()
       if(PositionGetString(POSITION_SYMBOL) != g_sym) continue;
       if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
 
-      g_posTicket = tk;
-      g_posType = (int)PositionGetInteger(POSITION_TYPE);
-      return;
+      g_posCount++;
+      if(g_posTicket == 0)
+      {
+         g_posTicket = tk;
+         g_posType = (int)PositionGetInteger(POSITION_TYPE);
+      }
    }
 }
 
@@ -387,8 +393,8 @@ string LiveGateStatus()
    if(InpUseDailyLossStop && p <= -InpDailyLossLimit)
       return "Status: daily loss limit — no new entries";
 
-   if(g_posTicket != 0)
-      return "Status: position open (one at a time)";
+   if(InpMaxOpenPositions > 0 && g_posCount >= InpMaxOpenPositions)
+      return StringFormat("Status: max positions open (%d/%d)", g_posCount, InpMaxOpenPositions);
 
    if(!CooldownOK())
       return "Status: cooldown between entries";
@@ -416,7 +422,7 @@ void PanelCreate()
    ObjectCreate(0, g_panel + "T", OBJ_LABEL, 0, 0, 0);
    ObjectSetInteger(0, g_panel + "T", OBJPROP_XDISTANCE, InpPanelX + 10);
    ObjectSetInteger(0, g_panel + "T", OBJPROP_YDISTANCE, InpPanelY + 6);
-   ObjectSetString(0, g_panel + "T", OBJPROP_TEXT, "DARKK SCALP AGGRESSIVE v2.03");
+   ObjectSetString(0, g_panel + "T", OBJPROP_TEXT, "DARKK SCALP AGGRESSIVE v2.21");
    ObjectSetString(0, g_panel + "T", OBJPROP_FONT, "Arial Black");
    ObjectSetInteger(0, g_panel + "T", OBJPROP_FONTSIZE, 13);
    ObjectSetInteger(0, g_panel + "T", OBJPROP_COLOR, C'120,230,170');
@@ -463,13 +469,21 @@ void PanelUpdate()
    double p = TodayProfit(entries);
 
    string pos = "FLAT";
-   if(g_posType == POSITION_TYPE_BUY)  pos = "LONG";
-   if(g_posType == POSITION_TYPE_SELL) pos = "SHORT";
+   if(g_posCount > 0)
+   {
+      pos = IntegerToString(g_posCount) + " pos";
+      if(g_posType == POSITION_TYPE_BUY)  pos += " (last LONG)";
+      if(g_posType == POSITION_TYPE_SELL) pos += " (last SHORT)";
+   }
 
    string s = g_sym + " " + EnumToString((ENUM_TIMEFRAMES)Period());
    if(g_sym != _Symbol)
       s += " | chart " + _Symbol;
-   s += " | Risk " + DoubleToString(InpRiskPercent, 2) + "%";
+   s += " | Risk " + DoubleToString(InpRiskPercent, 2) + "%/trade";
+   if(InpMaxOpenPositions <= 0)
+      s += " | open cap: off";
+   else
+      s += " | max open " + IntegerToString(InpMaxOpenPositions);
    s += " | " + pos;
 
    string d = "Today P/L " + DoubleToString(p, 2);
@@ -530,12 +544,13 @@ int OnInit()
    PanelCreate();
    ScanPosition();
 
-   Print("DarkkScalp Aggressive v2.03 loaded | TRADE=", g_sym,
+   Print("DarkkScalp Aggressive v2.21 loaded | TRADE=", g_sym,
          (g_sym != _Symbol ? " | CHART=" + _Symbol : ""),
          " | TF=", EnumToString((ENUM_TIMEFRAMES)Period()),
          " | Risk%=", DoubleToString(InpRiskPercent, 2),
          " | Daily target=", DoubleToString(InpDailyProfitTarget, 2),
-         " | Daily loss=", DoubleToString(InpDailyLossLimit, 2));
+         " | Daily loss=", DoubleToString(InpDailyLossLimit, 2),
+         " | MaxOpenPos=", (InpMaxOpenPositions <= 0 ? "unlimited" : IntegerToString(InpMaxOpenPositions)));
 
    return INIT_SUCCEEDED;
 }
@@ -573,7 +588,7 @@ void OnTick()
    if(!SpreadOK()) return;
    if(!SessionOK()) return;
    if(!DailyLimitsOK()) return;
-   if(g_posTicket != 0) return;
+   if(InpMaxOpenPositions > 0 && g_posCount >= InpMaxOpenPositions) return;
    if(!CooldownOK()) return;
 
    if(iBars(g_sym, PERIOD_CURRENT) < InpEMATrend + 20) return;
@@ -681,7 +696,7 @@ void OpenOrder(const bool buy, const double atrVal)
       return;
    }
 
-   string cmt = "DarkkScalp_Agg_v2";
+   string cmt = "DarkkScalp_Agg_v221";
    bool ok = buy ? g_trade.Buy(lots, g_sym, 0, sl, tp, cmt)
                  : g_trade.Sell(lots, g_sym, 0, sl, tp, cmt);
 
@@ -703,25 +718,14 @@ void OpenOrder(const bool buy, const double atrVal)
 }
 
 //+------------------------------------------------------------------+
-void ManageTrades()
+void ManageSinglePosition(const ulong ticket, const double a, const double bid, const double ask)
 {
-   if(g_posTicket == 0 || !PositionSelectByTicket(g_posTicket)) return;
-   if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) return;
-   if(PositionGetString(POSITION_SYMBOL) != g_sym) return;
+   if(!PositionSelectByTicket(ticket)) return;
 
    double open = PositionGetDouble(POSITION_PRICE_OPEN);
    double sl   = PositionGetDouble(POSITION_SL);
    double tp   = PositionGetDouble(POSITION_TP);
    int typ     = (int)PositionGetInteger(POSITION_TYPE);
-
-   double atr[1];
-   if(CopyBuffer(hATR, 0, 1, 1, atr) < 1) return;
-   double a = atr[0];
-   if(a <= 0) return;
-
-   double bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
-   double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
-   if(bid <= 0 || ask <= 0) return;
 
    double slDist = MathAbs(open - sl);
    if(slDist <= 0) return;
@@ -746,7 +750,7 @@ void ManageTrades()
       bool better = (typ == POSITION_TYPE_BUY) ? (nsl > sl && nsl < bid)
                                                : ((sl == 0 || nsl < sl) && nsl > ask);
       if(better)
-         g_trade.PositionModify(g_posTicket, nsl, tp);
+         g_trade.PositionModify(ticket, nsl, tp);
    }
 
    // ATR trailing stop.
@@ -758,14 +762,37 @@ void ManageTrades()
       {
          double nsl = NormalizeDouble(bid - dist, g_symDigits);
          if(nsl > sl && nsl < bid)
-            g_trade.PositionModify(g_posTicket, nsl, tp);
+            g_trade.PositionModify(ticket, nsl, tp);
       }
       else
       {
          double nsl = NormalizeDouble(ask + dist, g_symDigits);
          if((sl == 0 || nsl < sl) && nsl > ask)
-            g_trade.PositionModify(g_posTicket, nsl, tp);
+            g_trade.PositionModify(ticket, nsl, tp);
       }
+   }
+}
+
+//+------------------------------------------------------------------+
+void ManageTrades()
+{
+   double atr[1];
+   if(CopyBuffer(hATR, 0, 1, 1, atr) < 1) return;
+   double a = atr[0];
+   if(a <= 0) return;
+
+   double bid = SymbolInfoDouble(g_sym, SYMBOL_BID);
+   double ask = SymbolInfoDouble(g_sym, SYMBOL_ASK);
+   if(bid <= 0 || ask <= 0) return;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong tk = PositionGetTicket(i);
+      if(!PositionSelectByTicket(tk)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != g_sym) continue;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
+
+      ManageSinglePosition(tk, a, bid, ask);
    }
 }
 //+------------------------------------------------------------------+
