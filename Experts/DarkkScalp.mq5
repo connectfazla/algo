@@ -37,7 +37,7 @@ input bool     InpForceMinLot        = true;     // If risk calc is below min lo
 
 //--- Daily account protection
 input bool     InpUseDailyProfitStop = true;
-input double   InpDailyProfitTarget  = 200.0;    // Cent acct: 200 = approx $2 if $10 shows as 1000
+input double   InpDailyProfitTarget  = 5000.0;    // Cent acct: 200 = approx $2 if $10 shows as 1000
 input bool     InpUseDailyLossStop   = true;
 input double   InpDailyLossLimit     = 300.0;    // Cent acct: 300 = approx $3 if $10 shows as 1000
 input int      InpMaxTradesPerDay    = 35;       // Prevents unlimited overtrading
